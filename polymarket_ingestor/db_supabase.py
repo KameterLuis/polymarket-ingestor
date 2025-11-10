@@ -18,12 +18,25 @@ TBL_EVENTS = "events"
 TBL_LASTVOL = "market_last_cumvolume"
 
 
+def _encode_for_postgrest(obj):
+    """Recursively convert datetimes to ISO strings so httpx/json can serialize."""
+    if isinstance(obj, datetime):
+        if obj.tzinfo is None:
+            obj = obj.replace(tzinfo=UTC)
+        return obj.astimezone(UTC).isoformat()
+    if isinstance(obj, list):
+        return [_encode_for_postgrest(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _encode_for_postgrest(v) for k, v in obj.items()}
+    return obj
+
+
 def connect(url: str, key: str) -> Client:
     return create_client(url, key)
 
 
 async def upsert_markets(sb, payload: list[dict]):
-    # payload is already a list of dicts with exact column names
+    payload = _encode_for_postgrest(payload)  # <— serialize datetimes
     sb.table(TBL_MARKETS).upsert(payload, on_conflict="id").execute()
 
 
