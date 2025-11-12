@@ -1,22 +1,10 @@
-from __future__ import annotations
-
-import asyncio
-
-from datetime import datetime, timedelta, timezone
-
-from aiolimiter import AsyncLimiter
-
-from . import db_supabase as db
 from .config import Config
 from .gamma_client import GammaClient
-from .pipelines import daily as daily_pipeline
-from .pipelines import hourly as hourly_pipeline
+from . import db_supabase as db
 from .pipelines import minute as minute_pipeline
-from .storage.s3 import archive_and_prune_minutes
+from datetime import datetime, timezone
 
 UTC = timezone.utc
-
-import json
 
 def _json_parse(x):
     if x is None:
@@ -31,6 +19,26 @@ def _json_parse(x):
                 return json.loads(s)
             except Exception:
                 return None
+    return None
+
+def _ts(x):
+    """Normalize Gamma timestamps to tz-aware datetime (UTC).
+    Accepts ISO strings, ms/seconds epoch, or datetime; returns datetime|None.
+    """
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        # if milliseconds epoch
+        if x > 1e12:
+            x = x / 1000.0
+        return datetime.fromtimestamp(float(x), tz=UTC)
+    if isinstance(x, str):
+        try:
+            return datetime.fromisoformat(x.replace("Z", "+00:00")).astimezone(UTC)
+        except Exception:
+            return None
+    if isinstance(x, datetime):
+        return x.astimezone(UTC) if x.tzinfo else x.replace(tzinfo=UTC)
     return None
 
 def _as_array_of_numbers(x):
@@ -52,33 +60,6 @@ def _as_array_of_numbers(x):
     except Exception:
         return [arr]
 
-def _json_or_none(x):
-    # pass lists/dicts through (for jsonb columns); stringify scalars; keep None
-    if x is None:
-        return None
-    if isinstance(x, (list, dict)):
-        return x
-    # strings from API are fine as-is for jsonb; but if your column is TEXT, keep as string
-    return x
-
-def _markets_list(e):
-    v = e.get("markets")
-    if isinstance(v, list):
-        out = []
-        for item in v:
-            if isinstance(item, dict) and "id" in item:
-                try:
-                    out.append(int(item["id"]))
-                except Exception:
-                    continue
-            else:
-                try:
-                    out.append(int(item))
-                except Exception:
-                    continue
-        return out or None
-    return None
-
 def _events_list(m):
     v = m.get("events")
     if isinstance(v, list):
@@ -102,41 +83,20 @@ def _events_list(m):
             return None
     return None
 
-
-def _ts(x):
-    """Normalize Gamma timestamps to tz-aware datetime (UTC).
-    Accepts ISO strings, ms/seconds epoch, or datetime; returns datetime|None.
-    """
-    if x is None:
-        return None
-    if isinstance(x, (int, float)):
-        # if milliseconds epoch
-        if x > 1e12:
-            x = x / 1000.0
-        return datetime.fromtimestamp(float(x), tz=UTC)
-    if isinstance(x, str):
+def _markets_list(e):
+    v = e.get("markets")
+    if isinstance(v, list):
         try:
-            # handle ...Z and offsetless ISO
-            return datetime.fromisoformat(x.replace("Z", "+00:00")).astimezone(UTC)
+            return [int(x) for x in v]
         except Exception:
             return None
-    if isinstance(x, datetime):
-        return x.astimezone(UTC) if x.tzinfo else x.replace(tzinfo=UTC)
+    if isinstance(v, (int, float)):
+        return [int(v)]
     return None
 
-
-async def seconds_until_next_minute(now=None) -> float:
-    now = now or datetime.now(tz=UTC)
-    nxt = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
-    return max((nxt - now).total_seconds(), 0.5)
-
-
 async def run_once(cfg: Config, sb, client: GammaClient):
-    # ids = await client.fetch_active_market_ids()
-    # markets = await client.fetch_markets_bulk(ids, cfg.bulk_size)
-    markets = await client.fetch_markets_all(closed="false")
+    markets = await client.fetch_markets()
 
-    # Build explicit dicts to avoid misalignment
     market_payload = []
     for m in markets:
         market_payload.append(
@@ -149,8 +109,7 @@ async def run_once(cfg: Config, sb, client: GammaClient):
                 "image": m.get("image"),
                 "startDate": _ts(m.get("startDate")),
                 "endDate": _ts(m.get("endDate")),
-                # match your Supabase column names exactly:
-                "outcomes": _json_parse(m.get("outcomes")) or [],  # JSONB or TEXT ok
+                "outcomes": _json_parse(m.get("outcomes")) or [],
                 "outcomePrices": _as_array_of_numbers(m.get("outcomePrices") or m.get("outcomePrice")),
                 "oneHourPriceChange": float(m.get("oneHourPriceChange", 0) or 0),
                 "oneDayPriceChange": float(m.get("oneDayPriceChange", 0) or 0),
@@ -167,14 +126,12 @@ async def run_once(cfg: Config, sb, client: GammaClient):
                 "volume1mo": float(m.get("volume1mo", 0) or 0),
                 "volume1yr": float(m.get("volume1yr", 0) or 0),
                 "liquidity": float(m.get("liquidity", m.get("liquidityNum", 0)) or 0),
-                # this must be int4[] in Supabase
                 "events": _events_list(m),
             }
         )
 
     await db.upsert_markets(sb, market_payload)
 
-    # Upsert events
     events = await client.fetch_events()
 
     event_payload = []
@@ -185,7 +142,6 @@ async def run_once(cfg: Config, sb, client: GammaClient):
             "title": e.get("title"),
             "slug": e.get("slug"),
             "description": e.get("description"),
-            # store tags as jsonb if your column is jsonb, else omit or stringify:
             "tags": _json_parse(e.get("tags")),
             "image": e.get("image"),
             "startDate": _ts(e.get("startDate")),
@@ -197,58 +153,14 @@ async def run_once(cfg: Config, sb, client: GammaClient):
             "volume1wk": float(e.get("volume1wk", 0) or 0),
             "volume1mo": float(e.get("volume1mo", 0) or 0),
             "volume1yr": float(e.get("volume1yr", 0) or 0),
-            # events.markets must be int4[] in Supabase
             "markets": _markets_list(e),
         })
 
     await db.upsert_events(sb, event_payload)
 
-    # Minute time series
     await minute_pipeline.write_minute(sb, markets, datetime.now(tz=UTC))
 
-
-def _events_list(m):
-    v = m.get("events")
-    if isinstance(v, list):
-        out = []
-        for item in v:
-            if isinstance(item, dict) and "id" in item:
-                try:
-                    out.append(int(item["id"]))
-                except Exception:
-                    continue
-            else:
-                # already a scalar ID
-                try:
-                    out.append(int(item))
-                except Exception:
-                    continue
-        return out or None
-    if m.get("eventId") is not None:
-        try:
-            return [int(m["eventId"])]
-        except Exception:
-            return None
-    return None
-
-
-def _markets_list(e):
-    v = e.get("markets")
-    if isinstance(v, list):
-        try:
-            return [int(x) for x in v]
-        except Exception:
-            return None
-    if isinstance(v, (int, float)):
-        return [int(v)]
-    return None
-
-
-async def loop(cfg: Config):
-    limiter = AsyncLimiter(cfg.reqs_per_window, cfg.window_seconds)
-    client = GammaClient(cfg.gamma_base, limiter)
-    sb = db.connect(cfg.supabase_url, cfg.supabase_key)
-
+async def loop(cfg: Config, sb, client: GammaClient):
     try:
         while True:
             now = datetime.now(tz=UTC)

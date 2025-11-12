@@ -97,7 +97,7 @@ class GammaClient:
         limit = 500
         offset = 0
         while True:
-            data = await self._get("/events", {"limit": limit, "offset": offset})
+            data = await self._get("/events", {"limit": limit, "offset": offset, "closed": False})
             items = data if isinstance(data, list) else data.get("data", [])
             if not items:
                 break

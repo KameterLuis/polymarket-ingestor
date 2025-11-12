@@ -15,19 +15,8 @@ TBL_M_1H = "market_candles_1h"
 TBL_M_1D = "market_candles_1d"
 TBL_MARKETS = "markets"
 TBL_EVENTS = "events"
-TBL_LASTVOL = "market_last_cumvolume"
 
 UPSERT_CHUNK = 1500
-
-def _dedup_by_key(rows: list[dict], key: str) -> list[dict]:
-    seen = {}
-    for r in rows:
-        v = r.get(key)
-        if v is None:
-            continue
-        # last one wins (usually newest page)
-        seen[v] = r
-    return list(seen.values())
 
 def _chunk(rows: list[dict], size: int = 500) -> list[list[dict]]:
     for i in range(0, len(rows), size):
@@ -35,7 +24,6 @@ def _chunk(rows: list[dict], size: int = 500) -> list[list[dict]]:
 
 
 def _encode_for_postgrest(obj):
-    """Recursively convert datetimes to ISO strings so httpx/json can serialize."""
     if isinstance(obj, datetime):
         if obj.tzinfo is None:
             obj = obj.replace(tzinfo=UTC)
@@ -52,56 +40,34 @@ def connect(url: str, key: str) -> Client:
 
 
 async def upsert_markets(sb, payload: list[dict]):
-    payload = _dedup_by_key(payload, "id")
+    print("upserting markets")
     payload = _encode_for_postgrest(payload)
     for chunk in _chunk(payload):
-        sb.table(TBL_MARKETS).upsert(chunk, on_conflict="id").execute()
+        sb.table(TBL_MARKETS).upsert(chunk, on_conflict="id", returning="minimal").execute()
+    print("done upserting markets")
 
 async def upsert_events(sb, payload: list[dict]):
-    payload = _dedup_by_key(payload, "id")
+    print("upserting events")
     payload = _encode_for_postgrest(payload)
     for chunk in _chunk(payload):
-        sb.table(TBL_EVENTS).upsert(chunk, on_conflict="id").execute()
+        sb.table(TBL_EVENTS).upsert(chunk, on_conflict="id", returning="minimal").execute()
+    print("done upserting events")
 
-
-
-async def upsert_minutes(sb: Client, rows: Iterable[tuple]):
-    keys = ["market_id", "ts", "price", "volume"]
-    payload = [dict(zip(keys, _serialize_row(r))) for r in rows]
-    sb.table(TBL_M_1M).upsert(payload, on_conflict="market_id,ts").execute()
-
+async def upsert_minutes(sb: Client, rows):
+    print("upserting minutes")
+    sb.table(TBL_M_1M).upsert(rows, on_conflict="market_id,ts", returning="minimal").execute()
+    print("done uperting minutes")
 
 async def upsert_hours(sb: Client, rows: Iterable[tuple]):
     keys = ["market_id", "ts", "price", "volume"]
     payload = [dict(zip(keys, _serialize_row(r))) for r in rows]
-    sb.table(TBL_M_1H).upsert(payload, on_conflict="market_id,ts").execute()
+    sb.table(TBL_M_1H).upsert(payload, on_conflict="market_id,ts", returning="minimal").execute()
 
 
 async def upsert_days(sb: Client, rows: Iterable[tuple]):
     keys = ["market_id", "ts", "price", "volume"]
     payload = [dict(zip(keys, _serialize_row(r))) for r in rows]
-    sb.table(TBL_M_1D).upsert(payload, on_conflict="market_id,ts").execute()
-
-
-async def get_last_cum(sb: Client, market_id: int) -> float | None:
-    res = (
-        sb.table(TBL_LASTVOL)
-        .select("last_cum_volume")
-        .eq("market_id", market_id)
-        .maybe_single()
-        .execute()
-    )
-    data = getattr(res, "data", None)
-    if data and isinstance(data, dict) and data.get("last_cum_volume") is not None:
-        return float(data["last_cum_volume"])
-    return None
-
-
-async def set_last_cum(sb: Client, market_id: int, v: float):
-    sb.table(TBL_LASTVOL).upsert(
-        {"market_id": market_id, "last_cum_volume": v}
-    ).execute()
-
+    sb.table(TBL_M_1D).upsert(payload, on_conflict="market_id,ts", returning="minimal").execute()
 
 async def fetch_minutes_range(
     sb: Client, start: datetime, end: datetime, page_size: int = 50000
