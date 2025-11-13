@@ -116,10 +116,20 @@ async def replace_rows(conn, schema, table, cols, rows, json_cols=frozenset()):
         await conn.rollback()
         raise e
 
-async def upsert_rows(conn, schema, table, cols, key_cols, rows, json_cols=frozenset()):
+async def upsert_rows(
+    conn, 
+    schema, 
+    table, 
+    cols, 
+    key_cols, 
+    rows, 
+    json_cols=frozenset(),
+    volatile_cols: list[str] | None = None  # <-- ADD THIS NEW ARGUMENT
+):
     """
-    Fast, async, pooler-friendly upsert using COPY -> Staging -> INSERT ON CONFLICT.
-    Rows should be a list of DICTIONARIES.
+    Fast, async, pooler-friendly upsert.
+    If `volatile_cols` is provided, the ON CONFLICT clause will ONLY update those
+    columns, which is vastly more efficient.
     """
     if not rows:
         return
@@ -127,10 +137,28 @@ async def upsert_rows(conn, schema, table, cols, key_cols, rows, json_cols=froze
     stg = f"_stg_{table}"
     col_ident_list = sql.SQL(", ").join(map(sql.Identifier, cols))
     key_ident_list = sql.SQL(", ").join(map(sql.Identifier, key_cols))
-    set_updates = sql.SQL(", ").join(
-        sql.SQL("{c} = EXCLUDED.{c}").format(c=sql.Identifier(c))
-        for c in cols if c not in key_cols
-    )
+
+    # --- THIS IS THE NEW LOGIC ---
+    
+    # Determine which columns to update. Default to all non-key cols.
+    if volatile_cols:
+        update_cols = [c for c in volatile_cols if c not in key_cols]
+    else:
+        # Fallback to the old, slow behavior
+        update_cols = [c for c in cols if c not in key_cols]
+    
+    if not update_cols:
+        # Nothing to update, so just do "DO NOTHING"
+        set_updates = sql.SQL("DO NOTHING")
+    else:
+        # Build the efficient SET clause
+        set_clause = sql.SQL(", ").join(
+            sql.SQL("{c} = EXCLUDED.{c}").format(c=sql.Identifier(c))
+            for c in update_cols
+        )
+        set_updates = sql.SQL("DO UPDATE SET {clause}").format(clause=set_clause)
+    
+    # --- END OF NEW LOGIC ---
 
     await conn.set_autocommit(False)
     try:
@@ -156,13 +184,13 @@ async def upsert_rows(conn, schema, table, cols, key_cols, rows, json_cols=froze
             await cur.execute(sql.SQL("""
                 INSERT INTO {tbl} ({cols})
                 SELECT {cols} FROM {stg}
-                ON CONFLICT ({key_cols}) DO UPDATE SET {updates}
+                ON CONFLICT ({key_cols}) {set_updates}
             """).format(
                 tbl=sql.Identifier(schema, table),
                 cols=col_ident_list,
                 stg=sql.Identifier(stg),
                 key_cols=key_ident_list,
-                updates=set_updates
+                set_updates=set_updates  # <-- Use the new set_updates logic
             ))
             
         await conn.commit()

@@ -27,37 +27,80 @@ C1D_COLS = C1M_COLS
 KEY = ("market_id", "ts")
 
 async def upsert_markets(conn, payload: list[dict]):
-    """Replaces all markets. Accepts the psycopg connection."""
+    """Upserts all markets. Accepts the psycopg connection."""
     print("upserting markets")
     now = time.time()
     
-    # Define which columns are JSON
-    json_cols = {"outcomes", "outcomePrices", "events"}
+    json_cols = {"outcomes", "outcomePrices", "events"} 
+    key_cols = ["id"]
     
-    # Pass the list[dict] payload directly
-    key_cols = ["id"] 
+    volatile_cols = [
+        "active",
+        "oneHourPriceChange",
+        "oneDayPriceChange",
+        "oneMonthPriceChange",
+        "oneWeekPriceChange",
+        "lastTradedPrice",
+        "bestAsk",
+        "bestBid",
+        "volume",
+        "volume24hr",
+        "volume1wk",
+        "volume1mo",
+        "volume1yr",
+        "liquidity",
+        "outcomePrices"
+    ]
     
     await upsert_rows(
         conn, 
         "public", 
         TBL_MARKETS, 
         MARKETS_COLS, 
-        key_cols,  # <-- Add this
+        key_cols,
         payload, 
-        json_cols=json_cols
+        json_cols=json_cols,
+        volatile_cols=volatile_cols  # <-- Pass the list here
     )
     # --------------------------
     
     print(f"Done upserting markets. Took {time.time() - now:.2f}s")
 
 async def upsert_events(conn, payload: list[dict]):
-    """Replaces all events. Accepts the psycopg connection."""
+    """Upserts all events. Accepts the psycopg connection."""
     print("upserting events")
     
-    # Define which columns are JSON
     json_cols = {"tags", "markets"}
-    
-    await replace_rows(conn, "public", TBL_EVENTS, EVENTS_COLS, payload, json_cols=json_cols)
+    key_cols = ["id"]  # Assuming 'id' is the primary key for events
+
+    # --- THIS IS THE NEW LOGIC ---
+
+    # Define the columns that change frequently.
+    # Static columns like title, slug, description, image, startDate, 
+    # and endDate will be left alone during updates.
+    #
+    # !! Review this list !!
+    volatile_cols = [
+        "active",
+        "competitive",
+        "liquidity",
+        "volume",
+        "volume24hr",
+        "volume1wk",
+        "volume1mo",
+        "volume1yr",
+    ]
+
+    await upsert_rows(
+        conn,
+        "public",
+        TBL_EVENTS,
+        EVENTS_COLS,
+        key_cols,
+        payload,
+        json_cols=json_cols,
+        volatile_cols=volatile_cols
+    )
     
     print("done upserting events")
 
@@ -65,17 +108,6 @@ async def upsert_minutes(conn, rows):
     """Upserts minute-by-minute data. Accepts psycopg connection."""
     print("upserting minutes")
     
-    # NOTE: Your `minute_pipeline` *must* return a list[dict] or list[tuple]
-    # This code assumes `rows` is already in the right format.
-    # If `rows` is list[tuple], we need a small change.
-    # For now, assuming your `minute_pipeline` produces list[dict]
-    # like your other payloads.
-    
-    # If `rows` is a list of tuples, it's already in a list[dict] format
-    # from the pipeline. Let's assume it's dicts for consistency.
-    # If `minute_pipeline` returns TUPLES, we must change _rows_to_csv_buffer
-    
-    # Assuming `rows` is list[dict] from `minute_pipeline.write_minute`
     await upsert_rows(conn, "public", TBL_M_1M, C1M_COLS, KEY, rows)
     
     print("done upserting minutes")
