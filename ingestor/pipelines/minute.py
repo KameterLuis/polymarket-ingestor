@@ -41,3 +41,4 @@ async def write_minute(sb, markets: Iterable[Dict], now_ts: datetime):
         rows.append({"market_id": mid, "ts": now_iso, "price": price, "volume": vol})
     if rows:
         await db.upsert_minutes(sb, rows)
+        return rows

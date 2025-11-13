@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List
+from .database.db_client import replace_table_atomic, copy_upsert_timeseries
 
 from supabase import Client, create_client
 
@@ -18,10 +19,18 @@ TBL_EVENTS = "events"
 
 UPSERT_CHUNK = 1500
 
+EVENTS_COLS  = ["id", "active", "title", "slug", "description", "image", "startDate", "endDate", "competitive", "liquidity", "volume", "volume24hr", "volume1wk", "volume1mo", "volume1yr", "markets", "tags"]
+MARKETS_COLS = ["id", "active", "question", "description", "slug", "image", "startDate", "endDate", "oneHourPriceChange", "oneDayPriceChange", "oneMonthPriceChange", "oneWeekPriceChange", "lastTradedPrice", "bestAsk", "bestBid", "volume", "volume24hr", "volume1wk", "volume1mo", "volume1yr", "liquidity", "events", "outcomes", "outcomePrices"]
+
+C1M_COLS = ["market_id", "volume", "price", "ts"]
+C1H_COLS = C1M_COLS
+C1D_COLS = C1M_COLS
+
+KEY = ("market_id", "ts")
+
 def _chunk(rows: list[dict], size: int = 500) -> list[list[dict]]:
     for i in range(0, len(rows), size):
         yield rows[i:i+size]
-
 
 def _encode_for_postgrest(obj):
     if isinstance(obj, datetime):
@@ -41,33 +50,29 @@ def connect(url: str, key: str) -> Client:
 
 async def upsert_markets(sb, payload: list[dict]):
     print("upserting markets")
-    payload = _encode_for_postgrest(payload)
-    for chunk in _chunk(payload):
-        sb.table(TBL_MARKETS).upsert(chunk, on_conflict="id", returning="minimal").execute()
+    replace_table_atomic("public","markets",MARKETS_COLS,payload,json_cols={"outcomes", "outcomePrices"})
+    #payload = _encode_for_postgrest(payload)
+    #for chunk in _chunk(payload):
+    #    sb.table(TBL_MARKETS).upsert(chunk, on_conflict="id", returning="minimal").execute()
     print("done upserting markets")
 
 async def upsert_events(sb, payload: list[dict]):
     print("upserting events")
-    payload = _encode_for_postgrest(payload)
-    for chunk in _chunk(payload):
-        sb.table(TBL_EVENTS).upsert(chunk, on_conflict="id", returning="minimal").execute()
+    replace_table_atomic("public","events",EVENTS_COLS,payload,json_cols={"tags"})
     print("done upserting events")
 
 async def upsert_minutes(sb: Client, rows):
     print("upserting minutes")
-    sb.table(TBL_M_1M).upsert(rows, on_conflict="market_id,ts", returning="minimal").execute()
+    copy_upsert_timeseries("public", "market_candles_1m", C1M_COLS, KEY, rows)
+    #sb.table(TBL_M_1M).upsert(rows, on_conflict="market_id,ts", returning="minimal").execute()
     print("done uperting minutes")
 
 async def upsert_hours(sb: Client, rows: Iterable[tuple]):
-    keys = ["market_id", "ts", "price", "volume"]
-    payload = [dict(zip(keys, _serialize_row(r))) for r in rows]
-    sb.table(TBL_M_1H).upsert(payload, on_conflict="market_id,ts", returning="minimal").execute()
+    copy_upsert_timeseries("public", "market_candles_1h", C1H_COLS, KEY, rows)
 
 
 async def upsert_days(sb: Client, rows: Iterable[tuple]):
-    keys = ["market_id", "ts", "price", "volume"]
-    payload = [dict(zip(keys, _serialize_row(r))) for r in rows]
-    sb.table(TBL_M_1D).upsert(payload, on_conflict="market_id,ts", returning="minimal").execute()
+    copy_upsert_timeseries("public", "market_candles_1d", C1D_COLS, KEY, rows)
 
 async def fetch_minutes_range(
     sb: Client, start: datetime, end: datetime, page_size: int = 50000

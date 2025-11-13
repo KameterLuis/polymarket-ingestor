@@ -158,19 +158,24 @@ async def run_once(cfg: Config, sb, client: GammaClient):
 
     await db.upsert_events(sb, event_payload)
 
-    await minute_pipeline.write_minute(sb, markets, datetime.now(tz=UTC))
+    rows = await minute_pipeline.write_minute(sb, markets, datetime.now(tz=UTC))
+
+    now = datetime.now(tz=UTC)
+
+    if now.minute == 0 and rows:
+        await db.upsert_hours(sb, rows)
+    if now.hour == 0 and now.minute == 0 and rows:
+        await db.upsert_days(sb, rows)
+
+async def seconds_until_next_minute(now=None) -> float:
+    now = now or datetime.now(tz=UTC)
+    nxt = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+    return max((nxt - now).total_seconds(), 0.5)
 
 async def loop(cfg: Config, sb, client: GammaClient):
     try:
         while True:
-            now = datetime.now(tz=UTC)
             await run_once(cfg, sb, client)
-
-            # rollups
-            if now.minute == 0:
-                await hourly_pipeline.rollup(sb, now)
-            if now.hour == 0 and now.minute == 0:
-                await daily_pipeline.rollup(sb, now)
 
             # archive + prune hot data (optional, enable when ready)
             # await archive_and_prune_minutes(sb, table=db.TBL_M_1M,
