@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import random
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -218,7 +219,9 @@ class GammaClient:
         params = {
             "closed": "false" if not closed else "true",
         }
-        return await self._fetch_paginated(
+        print("Fetching markets")
+        now = time.time()
+        response = await self._fetch_paginated(
             "/markets",
             limit=limit,
             base_params=params,
@@ -228,6 +231,8 @@ class GammaClient:
             batch_pages=batch_pages,
             verbose=verbose,
         )
+        print("Took ", time.time() - now)
+        return response
 
     async def fetch_events(
         self,
