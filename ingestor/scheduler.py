@@ -1,104 +1,78 @@
-from .config import Config
-from .gamma_client import GammaClient
-from . import db_supabase as db
-from .pipelines import minute as minute_pipeline
+import asyncio
+import os
+import json
 from datetime import datetime, timezone, timedelta
-from .database.db_client import get_async_connection
+from .gamma_client import GammaClient
+from .helpers import _json_parse, _ts, _as_array_of_numbers, _events_list, _markets_list, seconds_until_next_minute, _events_to_redis_pipeline
+import redis
+import boto3
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
 
-UTC = timezone.utc
+load_dotenv()
 
-def _json_parse(x):
-    if x is None:
-        return None
-    if isinstance(x, (list, dict)):
-        return x
-    if isinstance(x, str):
-        s = x.strip()
-        if s and (s[0] in "[{" and s[-1] in "]}"):
-            try:
-                import json
-                return json.loads(s)
-            except Exception:
-                return None
-    return None
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
-def _ts(x):
-    """Normalize Gamma timestamps to tz-aware datetime (UTC).
-    Accepts ISO strings, ms/seconds epoch, or datetime; returns datetime|None.
-    """
-    if x is None:
-        return None
-    if isinstance(x, (int, float)):
-        # if milliseconds epoch
-        if x > 1e12:
-            x = x / 1000.0
-        return datetime.fromtimestamp(float(x), tz=UTC)
-    if isinstance(x, str):
+AWS_SQS_QUEUE_URL = os.getenv("AWS_SQS_QUEUE_URL")
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_S3_REGION", "us-east-1")
+
+try:
+    redis_client = redis.from_url(
+        UPSTASH_URL,
+        password=UPSTASH_TOKEN,
+        decode_responses=True
+    )
+    redis_client.ping()
+    print("✅ Successfully connected to Upstash (Redis)")
+except Exception as e:
+    print(f"❌ ERROR connecting to Upstash (Redis): {e}")
+    redis_client = None
+
+try:
+    sqs_client = boto3.client(
+        'sqs',
+        region_name=AWS_REGION,
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY
+    )
+    print("✅ Successfully configured AWS SQS client")
+except Exception as e:
+    print(f"❌ ERROR configuring SQS client: {e}")
+    sqs_client = None
+
+MARKET_CACHE_TTL_SECONDS = 60 * 60 
+SQS_BATCH_SIZE = 200 
+
+def _markets_to_redis_pipeline(pipe, markets: list[dict]):
+    print(f"  > Preparing {len(markets)} markets for Redis cache...")
+    for market in markets:
         try:
-            return datetime.fromisoformat(x.replace("Z", "+00:00")).astimezone(UTC)
-        except Exception:
-            return None
-    if isinstance(x, datetime):
-        return x.astimezone(UTC) if x.tzinfo else x.replace(tzinfo=UTC)
-    return None
+            key = f"market:{market['id']}"
+            value = json.dumps(market)
+            pipe.set(key, value, ex=MARKET_CACHE_TTL_SECONDS)
+        except Exception as e:
+            print(f"  > Error preparing market {market.get('id')} for Redis: {e}")
+    return pipe
 
-def _as_array_of_numbers(x):
-    arr = _json_parse(x)
-    if arr is None:
-        # If API returned nothing, use empty list (works with jsonb NOT NULL)
-        return []
-    if isinstance(arr, list):
-        out = []
-        for v in arr:
-            try:
-                out.append(float(v))
-            except Exception:
-                out.append(v)  # keep as-is if not numeric
-        return out
-    # scalar -> wrap
+def _send_sqs_batch(batch: list[dict]):
     try:
-        return [float(arr)]
-    except Exception:
-        return [arr]
+        message_body = json.dumps(batch)
+        
+        response = sqs_client.send_message(
+            QueueUrl=AWS_SQS_QUEUE_URL,
+            MessageBody=message_body
+        )
+        return response['MessageId']
+    except ClientError as e:
+        print(f"  > ❌ SQS Send Error: {e}")
+        return None
 
-def _events_list(m):
-    v = m.get("events")
-    if isinstance(v, list):
-        out = []
-        for item in v:
-            if isinstance(item, dict) and "id" in item:
-                try:
-                    out.append(int(item["id"]))
-                except Exception:
-                    continue
-            else:
-                try:
-                    out.append(int(item))
-                except Exception:
-                    continue
-        return out or None
-    if m.get("eventId") is not None:
-        try:
-            return [int(m["eventId"])]
-        except Exception:
-            return None
-    return None
-
-def _markets_list(e):
-    v = e.get("markets")
-    if isinstance(v, list):
-        try:
-            return [int(x) for x in v]
-        except Exception:
-            return None
-    if isinstance(v, (int, float)):
-        return [int(v)]
-    return None
-
-async def run_once(cfg: Config, client: GammaClient, db_conn):
+async def run_once(client: GammaClient):
     try:
         markets = await client.fetch_markets()
-
         market_payload = []
         for m in markets:
             market_payload.append(
@@ -131,12 +105,9 @@ async def run_once(cfg: Config, client: GammaClient, db_conn):
                     "events": _events_list(m),
                 }
             )
-
-        await db.upsert_markets(db_conn, market_payload)
-
+        
         events = await client.fetch_events()
-
-        event_payload = []
+        event_payload = [] 
         for e in events:
             event_payload.append({
                 "id": int(e.get("id")),
@@ -158,51 +129,60 @@ async def run_once(cfg: Config, client: GammaClient, db_conn):
                 "markets": _markets_list(e),
             })
 
-        await db.upsert_events(db_conn, event_payload)
+        print(f"Fetched {len(market_payload)} markets and {len(event_payload)} events.")
 
-        rows = await minute_pipeline.write_minute(db_conn, markets, datetime.now(tz=UTC))
+        if redis_client:
+            try:
+                # Use a pipeline for blazing-fast bulk uploads
+                pipe = redis_client.pipeline()
+                
+                # Add all markets to the pipeline
+                _markets_to_redis_pipeline(pipe, market_payload)
+                
+                # Add all events to the pipeline (using "event:123" key)
+                # (You'll need a new helper `_events_to_redis_pipeline`)
+                _events_to_redis_pipeline(pipe, event_payload)
+                
+                print("  > Sending bulk upload to Upstash (Redis)...")
+                await asyncio.to_thread(pipe.execute)
+                print("  > ✅ Upstash cache updated.")
+                
+            except Exception as e:
+                print(f"  > ❌ Upstash (Redis) Error: {e}")
+        
+        if sqs_client:
+            print(f"  > Preparing {len(market_payload)} markets for SQS queue...")
+            batch_count = 0
+            for i in range(0, len(market_payload), SQS_BATCH_SIZE):
+                batch = market_payload[i:i + SQS_BATCH_SIZE]
+                message_id = await asyncio.to_thread(_send_sqs_batch, batch)
+                
+                if message_id:
+                    batch_count += 1
+                
+            print(f"  > ✅ SQS queue updated with {batch_count} batches.")
 
-        now = datetime.now(tz=UTC)
-
-        if now.minute == 0 and rows:
-            await db.upsert_hours(db_conn, rows)
-        if now.hour == 0 and now.minute == 0 and rows:
-            await db.upsert_days(db_conn, rows)
     except Exception as e:
         print(f"Error during run_once: {e}")
 
-
-async def seconds_until_next_minute(now=None) -> float:
-    now = now or datetime.now(tz=UTC)
-    nxt = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
-    return max((nxt - now).total_seconds(), 0.5)
-
-async def loop(cfg: Config, client: GammaClient):
-    db_conn = None
+async def loop(client: GammaClient):
     try:
-
-        db_conn = await get_async_connection()
-        print("Database connection established.")
+        if not redis_client or not sqs_client:
+            print("❌ Critical component not initialized (Redis or SQS). Exiting.")
+            return
 
         while True:
-            await run_once(cfg, client, db_conn)
-
-            # archive + prune hot data (optional, enable when ready)
-            # await archive_and_prune_minutes(sb, table=db.TBL_M_1M,
-            # older_than=now - timedelta(minutes=cfg.retention_minute_minutes),
-            # bucket=cfg.s3_bucket, region=cfg.s3_region, prefix=cfg.s3_prefix)
-            # await archive_and_prune_minutes(sb, table=db.TBL_M_1H,
-            # older_than=now - timedelta(days=cfg.retention_hour_days),
-            # bucket=cfg.s3_bucket, region=cfg.s3_region, prefix=cfg.s3_prefix)
-
+            await run_once(client)
             await asyncio.sleep(await seconds_until_next_minute())
+            
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\nShutdown requested (Ctrl+C or Cancelled)...")
+        
     finally:
         print("Cleaning up connections...")
-        if db_conn:
-            await db_conn.close()
-            print("Database connection closed.")
+        if redis_client:
+            redis_client.close()
+            print("Upstash (Redis) connection closed.")
         
         await client.close()
         print("GammaClient closed. Exiting.")

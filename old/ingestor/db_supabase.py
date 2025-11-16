@@ -2,11 +2,97 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Iterable, List
 from .database.db_client import replace_rows, upsert_rows
+import aiobotocore
+import io
+import os
 
 UTC = timezone.utc
+
+async def archive_and_delete_minutes(conn, table_name: str, retention_period: timedelta):
+    """
+    1. Selects all rows from `table_name` older than the `retention_period`.
+    2. Streams them as a CSV to S3.
+    3. If the upload is successful, deletes the rows from Postgres.
+    """
+    print(f"Starting archive for {table_name}...")
+    
+    # 1. Get S3 settings from environment
+    bucket_name = os.getenv("AWS_S3_BUCKET")
+    region = os.getenv("AWS_S3_REGION")
+    if not bucket_name:
+        print("Error: AWS_S3_BUCKET not set. Skipping archive.")
+        return
+
+    # 2. Define queries and S3 key
+    cutoff_ts = datetime.now(timezone.utc) - retention_period
+    
+    # We will name the S3 file based on the time it was archived
+    now_ts = datetime.now(timezone.utc)
+    s3_key = f"{table_name}/{now_ts.year}/{now_ts.month:02d}/{now_ts.day:02d}/{now_ts.isoformat()}.csv"
+
+    # Use SQL for safe table/column names
+    tbl = sql.Identifier(table_name)
+    select_query = sql.SQL("SELECT * FROM {tbl} WHERE ts < %s FOR UPDATE").format(tbl=tbl)
+    delete_query = sql.SQL("DELETE FROM {tbl} WHERE ts < %s").format(tbl=tbl)
+    
+    # This magic query tells Postgres to create a CSV from our SELECT
+    copy_query = sql.SQL("COPY ({select_query}) TO STDOUT WITH (FORMAT CSV, HEADER TRUE)").format(
+        select_query=select_query
+    )
+
+    # 3. Create S3 client
+    session = aiobotocore.get_session()
+    async with session.create_client(
+        's3',
+        region_name=region,
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+    ) as s3_client:
+        
+        # 4. Start transaction
+        await conn.set_autocommit(False)
+        try:
+            async with conn.cursor() as cur:
+                
+                # 5. Stream data from Postgres using COPY
+                print(f"  Fetching data older than {cutoff_ts}...")
+                buf = io.BytesIO()
+                async with cur.copy(copy_query, (cutoff_ts,)) as copy:
+                    async for data in copy:
+                        buf.write(data)
+                
+                buf.seek(0)
+                csv_data = buf.read()
+                
+                if not csv_data:
+                    print("  No data to archive.")
+                    await conn.commit()  # Commit to release the (empty) transaction
+                    return
+
+                print(f"  Uploading {len(csv_data)} bytes to s3://{bucket_name}/{s3_key}")
+                
+                # 6. Upload data to S3
+                await s3_client.put_object(
+                    Bucket=bucket_name,
+                    Key=s3_key,
+                    Body=csv_data
+                )
+                
+                # 7. SUCCESS! Now delete the data
+                print("  Upload successful. Deleting old rows from Postgres...")
+                await cur.execute(delete_query, (cutoff_ts,))
+                
+                await conn.commit()
+                print("  Archive and delete complete.")
+
+        except Exception as e:
+            print(f"Archive FAILED: {e}")
+            await conn.rollback()
+            # Re-raise the exception so the scheduler can see it
+            raise e
 
 # Table names
 TBL_M_1M = "market_candles_1m"
